@@ -19396,11 +19396,6 @@ function sseBlocksFromBuffer(buffer, { flush = false } = {}) {
   return { blocks, rest };
 }
 
-// --- Dangerous-command approval card (gateway exec approval) -------------------------------------------
-// The gateway blocks a turn's flagged command and streams an `approval.request` SSE event;
-// this card surfaces it in the panel and answers through POST /v1/runs/{run_id}/approval.
-// Silence still fails closed on the gateway side — the card is only a viewport, not the gate.
-
 let pendingExecApproval = null;
 let execApprovalHideTimer = 0;
 
@@ -19430,8 +19425,6 @@ function showExecApprovalRequest(data) {
   if (els.execApprovalAlwaysButton) els.execApprovalAlwaysButton.hidden = !choices.includes('always');
   for (const button of els.execApprovalActions?.querySelectorAll('button') || []) button.disabled = false;
   if (execApprovalHideTimer) clearTimeout(execApprovalHideTimer);
-  // Hard cap only: the run's own terminal event (onRuntime) hides the card as soon as the
-  // turn settles, and a late click answers to a resolved request gets a clean 409 retirement.
   execApprovalHideTimer = setTimeout(hideExecApprovalNotice, 15 * 60 * 1000);
   els.execApprovalNotice.hidden = false;
 }
@@ -19456,7 +19449,6 @@ async function decideExecApproval(choice) {
   } catch (error) {
     const status = Number(error?.httpStatus ?? error?.status);
     if (status === 409 || /no pending approval|no active approval/i.test(String(error?.message || ''))) {
-      // Already answered or expired somewhere else (another surface, timeout) — retire the card quietly.
       hideExecApprovalNotice();
       setStatus('warn', t('exec_approval.kicker'), t('exec_approval.expired'), { translateDetail: false });
       return;
@@ -19479,8 +19471,6 @@ async function readSseResponse(response, onDelta, onTool, { signal, onRun, onSte
     const event = parseSseBlock(block);
     const data = event.json || {};
     if (event.type === 'approval.request' && data.run_id) {
-      // Dangerous-command gate: show the Approve/Reject card; the turn keeps
-      // streaming and the agent blocks until a decision or the gateway timeout.
       onApproval?.(data);
       return false;
     }
@@ -20883,7 +20873,6 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
             const status = String(payload?.status || '').trim().toLowerCase();
             if (['completed', 'failed', 'cancelled'].includes(status)) {
               streamTerminalStatus = status;
-              // The turn settled: any still-visible approval card is stale (answered elsewhere or timed out).
               hideExecApprovalNotice();
             }
             applyTurnRuntimePayload(payload);
