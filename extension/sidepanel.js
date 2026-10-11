@@ -143,6 +143,12 @@ import {
 import { blobatar as blobatarSvg } from './lib/vendor/blobatar-2.0.0.js';
 import { renderMarkdownSafe, sanitizeHtml } from './lib/sanitizer.mjs';
 import { highlightCodeBlocks } from './lib/code-highlighting.mjs';
+import {
+  EXEC_APPROVAL_CHOICES,
+  execApprovalRequestPayload,
+  isExecApprovalRetired,
+  normalizeExecApprovalChoices,
+} from './lib/exec-approval.mjs';
 import { enhanceMarkdownCodeBlocks } from './lib/markdown-code-copy.mjs';
 import {
   completionRevealPlan,
@@ -19399,6 +19405,15 @@ function sseBlocksFromBuffer(buffer, { flush = false } = {}) {
 let pendingExecApproval = null;
 let execApprovalHideTimer = 0;
 
+function execApprovalChoiceButtons() {
+  return [
+    [els.execApprovalOnceButton, 'once'],
+    [els.execApprovalSessionButton, 'session'],
+    [els.execApprovalAlwaysButton, 'always'],
+    [els.execApprovalDenyButton, 'deny'],
+  ];
+}
+
 function hideExecApprovalNotice() {
   pendingExecApproval = null;
   if (execApprovalHideTimer) {
@@ -19408,7 +19423,7 @@ function hideExecApprovalNotice() {
   const notice = els.execApprovalNotice;
   if (!notice) return;
   notice.hidden = true;
-  for (const button of els.execApprovalActions?.querySelectorAll('button') || []) button.disabled = false;
+  for (const [button] of execApprovalChoiceButtons()) button.disabled = false;
 }
 
 function showExecApprovalRequest(data) {
@@ -19418,12 +19433,11 @@ function showExecApprovalRequest(data) {
   pendingExecApproval = { runId, requestId: String(data.request_id || '') };
   els.execApprovalCommand.textContent = String(data.command || '');
   els.execApprovalReason.textContent = String(data.description || data.reason || '');
-  const choices = Array.isArray(data.choices) && data.choices.length
-    ? data.choices.map((choice) => String(choice).toLowerCase())
-    : ['once', 'session', 'always', 'deny'];
-  if (els.execApprovalSessionButton) els.execApprovalSessionButton.hidden = !choices.includes('session');
-  if (els.execApprovalAlwaysButton) els.execApprovalAlwaysButton.hidden = !choices.includes('always');
-  for (const button of els.execApprovalActions?.querySelectorAll('button') || []) button.disabled = false;
+  const offered = normalizeExecApprovalChoices(data.choices);
+  for (const [button, choice] of execApprovalChoiceButtons()) {
+    button.hidden = !offered.includes(choice);
+    button.disabled = false;
+  }
   if (execApprovalHideTimer) clearTimeout(execApprovalHideTimer);
   execApprovalHideTimer = setTimeout(hideExecApprovalNotice, 15 * 60 * 1000);
   els.execApprovalNotice.hidden = false;
@@ -19431,24 +19445,22 @@ function showExecApprovalRequest(data) {
 
 async function decideExecApproval(choice) {
   const approval = pendingExecApproval;
-  if (!approval) return;
-  const buttons = [...(els.execApprovalActions?.querySelectorAll('button') || [])];
+  const payload = execApprovalRequestPayload(choice, approval?.requestId);
+  if (!approval || !payload) return;
+  const buttons = execApprovalChoiceButtons().map(([button]) => button);
   for (const button of buttons) button.disabled = true;
   try {
     const response = await apiFetch(`/v1/runs/${encodeURIComponent(approval.runId)}/approval`, {
       method: 'POST',
-      body: JSON.stringify(approval.requestId
-        ? { choice, request_id: approval.requestId }
-        : { choice }),
+      body: JSON.stringify(payload),
     });
-    const payload = await readJsonResponse(response);
+    const payloadResult = await readJsonResponse(response);
     if (!response.ok) {
-      throw Object.assign(new Error(payload?.error?.message || payload?.message || `HTTP ${response.status}`), { httpStatus: response.status });
+      throw Object.assign(new Error(payloadResult?.error?.message || payloadResult?.message || `HTTP ${response.status}`), { httpStatus: response.status });
     }
     hideExecApprovalNotice();
   } catch (error) {
-    const status = Number(error?.httpStatus ?? error?.status);
-    if (status === 409 || /no pending approval|no active approval/i.test(String(error?.message || ''))) {
+    if (isExecApprovalRetired(error?.httpStatus ?? error?.status, error?.message)) {
       hideExecApprovalNotice();
       setStatus('warn', t('exec_approval.kicker'), t('exec_approval.expired'), { translateDetail: false });
       return;
@@ -21111,6 +21123,7 @@ ${streamError.message}`);
     }
   } finally {
     if (turnRunControlGeneration === runControlGeneration) {
+      hideExecApprovalNotice();
       activeRunControl = markRunStreamClosed(activeRunControl);
       if ([RUN_CONTROL_PHASES.RUNNING, RUN_CONTROL_PHASES.UNCONFIRMED].includes(activeRunControl?.phase)) {
         if (!activeRunId) {
