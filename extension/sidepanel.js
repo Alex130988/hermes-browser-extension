@@ -8494,7 +8494,6 @@ function applySidecarArt() {
 applySidecarArt();
 createBackgroundArtRotation({
   root: document.documentElement,
-  document,
   storage: browserApi?.storage?.local,
 });
 
