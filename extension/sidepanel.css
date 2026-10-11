@@ -4166,6 +4166,12 @@ textarea::-webkit-scrollbar-track { background: transparent; }
 .composer-icon:disabled { cursor: not-allowed; opacity: 0.42; }
 .composer-wake { right: 67px; }
 .composer-mic { right: 38px; }
+.composer-live { right: 67px; }
+.composer-wake:not([hidden]) ~ .composer-live { right: 96px; }
+/* While a turn runs with a draft, Stop/Queue/Steer take 9-67px: keep End reachable. */
+.composer-input-wrap.busy-draft .composer-live { right: 96px; }
+/* A live session uses the themed .active fill/text pair; no colour override, so
+   the icon keeps its verified contrast in every theme. */
 .composer-input-wrap.busy-draft .composer-wake,
 .composer-input-wrap.busy-draft .composer-mic { display: none; }
 .composer-wake.listening {
@@ -6598,6 +6604,9 @@ html[dir="rtl"] .context-popover dd,
 html[dir="rtl"] .context-receipt dd { text-align: start; }
 html[dir="rtl"] .conn-mode-check { margin-left: 0; margin-right: auto; }
 html[dir="rtl"] .composer-wake { right: auto; left: 67px; }
+html[dir="rtl"] .composer-live { right: auto; left: 67px; }
+html[dir="rtl"] .composer-wake:not([hidden]) ~ .composer-live { right: auto; left: 96px; }
+html[dir="rtl"] .composer-input-wrap.busy-draft .composer-live { right: auto; left: 96px; }
 html[dir="rtl"] .composer-mic { right: auto; left: 38px; }
 html[dir="rtl"] .composer-send,
 html[dir="rtl"] .composer-stop,

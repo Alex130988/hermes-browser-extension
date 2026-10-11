@@ -370,6 +370,7 @@ import {
 import {
   transcribeAudioViaDashboard,
   resolveDashboardTranscriptionBaseUrl,
+  fetchVoiceLiveStatus,
   dashboardFileStreamUrl,
   dashboardModelDiscoveryBaseUrl,
   fetchDashboardMediaDataUrl,
@@ -769,6 +770,7 @@ const els = {
   stopButton: $('#stopButton'),
   wakeButton: $('#wakeButton'),
   voiceButton: $('#voiceButton'),
+  liveVoiceButton: $('#liveVoiceButton'),
   voiceActivity: $('#voiceActivity'),
   voiceActivityLabel: $('#voiceActivityLabel'),
   voiceActivityTimer: $('#voiceActivityTimer'),
@@ -1232,6 +1234,13 @@ let voiceRecorderChunks = [];
 let voiceCaptureSession = null;
 let voiceWingbeat = null;
 let voiceWingbeatLoading = null;
+// GPT-Live voice chat (see startLiveVoice). The module loads on demand.
+const VOICE_LIVE_STATUS_TTL_MS = 10 * 60_000;
+let voiceLiveModuleLoading = null;
+let voiceLiveStatus = null;
+let voiceLiveStatusLoading = null;
+let voiceLiveStatusTimer = null;
+let liveVoice = null;
 let dictating = false;
 let transcribingVoice = false;
 let voiceTransitionInFlight = false;
@@ -2040,6 +2049,10 @@ function markConnectionProbe(status, detail = '', diagnostic = null) {
   if (connectionProbeDiagnostic) lastGatewayDiagnostic = connectionProbeDiagnostic;
   if (status === 'connected') lastGatewayDiagnostic = null;
   updateConnectionPrompt();
+  // Live voice is offered per connection: hide it when the link drops, look
+  // again (cached per connection and profile) when it comes back.
+  updateLiveVoiceButtonState();
+  if (status === 'connected') scheduleVoiceLiveStatusRefresh();
 }
 
 function setStatus(kind, title, detail, { translateTitle = true, translateDetail = true } = {}) {
@@ -3935,6 +3948,7 @@ async function unlockContextScope() {
 
 function setGatewayCapabilities(caps) {
   gatewayCapabilities = caps || { ...DEFAULT_GATEWAY_CAPABILITIES };
+  scheduleVoiceLiveStatusRefresh();
   const nextDeveloperMode = gatewayCapabilities.browserControlDeveloperMode === true;
   const nextArtifactTransport = gatewayCapabilities.browserControlArtifactTransport === true;
   if (settings.browserControlDeveloperMode !== nextDeveloperMode
@@ -5686,7 +5700,7 @@ function updateVoiceButtonState() {
   const dedicatedPage = canOpenVoiceDictationPage();
   const browserSpeech = canUseBrowserSpeechFallback();
   const supported = directRecorder || browserSpeech || dedicatedPage;
-  els.voiceButton.disabled = !supported || voiceTransitionInFlight;
+  els.voiceButton.disabled = !supported || voiceTransitionInFlight || Boolean(liveVoice);
   els.voiceButton.classList.toggle('recording', dictating);
   els.voiceButton.classList.toggle('active', dictating);
   const mode = canUseHermesVoiceTranscription()
@@ -5699,6 +5713,7 @@ function updateVoiceButtonState() {
     : (dictating ? `Stop voice dictation (${mode})` : `Start voice dictation (${mode})`);
   els.voiceButton.setAttribute('aria-label', els.voiceButton.title);
   els.voiceButton.setAttribute('aria-busy', String(voiceTransitionInFlight || transcribingVoice));
+  updateLiveVoiceButtonState();
   renderVoiceActivity();
 }
 
@@ -5706,26 +5721,29 @@ function renderVoiceActivity() {
   const meter = els.voiceActivity;
   if (!meter) return;
   const session = voiceCaptureSession;
+  const live = liveVoice;
   const recording = Boolean(dictating && session && !session.stopRequested);
   const transcribing = Boolean(transcribingVoice);
   syncVoiceGlow();
   // This runs four times a second while dictating. Write only what changed, and
   // move the level bars with transforms, so the meter never re-lays out the panel.
-  const hidden = !(recording || transcribing);
+  const hidden = !(recording || transcribing || live);
   if (meter.hidden !== hidden) meter.hidden = hidden;
-  meter.classList.toggle('recording', recording);
-  meter.classList.toggle('transcribing', transcribing);
+  meter.classList.toggle('live', Boolean(live));
+  meter.classList.toggle('recording', live ? !live.delegationId : recording);
+  meter.classList.toggle('transcribing', live ? Boolean(live.delegationId) : transcribing);
   if (els.voiceActivityLabel) {
-    const label = transcribing ? 'Transcribing' : 'Dictating';
+    const label = live ? liveVoiceStatusLabel(live) : (transcribing ? 'Transcribing' : 'Dictating');
     if (els.voiceActivityLabel.textContent !== label) els.voiceActivityLabel.textContent = label;
   }
   if (els.voiceActivityTimer) {
-    const startedAt = Number(session?.startedAt || 0);
+    const startedAt = Number((live ? live.startedAt : session?.startedAt) || 0);
     const elapsed = formatVoiceElapsed(startedAt ? (Date.now() - startedAt) / 1000 : 0);
     if (els.voiceActivityTimer.textContent !== elapsed) els.voiceActivityTimer.textContent = elapsed;
   }
   const bars = els.voiceActivityBars?.querySelectorAll('i') || [];
-  const heights = voiceLevelBarHeights(Number(session?.level || 0), { active: recording && !transcribing });
+  const level = live ? Number(live.session?.level?.() || 0) : Number(session?.level || 0);
+  const heights = voiceLevelBarHeights(level, { active: live ? live.phase === 'live' : recording && !transcribing });
   bars.forEach((bar, index) => {
     const scale = `scaleY(${(heights[index] || 0.25).toFixed(2)})`;
     if (bar.style.transform !== scale) bar.style.transform = scale;
@@ -5740,8 +5758,8 @@ function loadVoiceWingbeat() {
     const host = document.getElementById('composerDropZone');
     if (!voiceWingbeat && host) {
       voiceWingbeat = createVoiceWingbeat(host, {
-        level: () => Number(voiceCaptureSession?.level || 0),
-        analyser: () => voiceCaptureSession?.analyser || null,
+        level: () => Number((liveVoice ? liveVoice.session?.level?.() : voiceCaptureSession?.level) || 0),
+        analyser: () => (liveVoice ? liveVoice.session?.analyser?.() : voiceCaptureSession?.analyser) || null,
       });
     }
     return voiceWingbeat;
@@ -5750,13 +5768,301 @@ function loadVoiceWingbeat() {
 }
 
 function syncVoiceGlow() {
-  const active = Boolean(dictating || transcribingVoice);
-  if (voiceWingbeat) voiceWingbeat.set({ active, processing: Boolean(transcribingVoice) });
+  const active = Boolean(dictating || transcribingVoice || liveVoice);
+  const processing = Boolean(transcribingVoice || liveVoice?.delegationId);
+  if (voiceWingbeat) voiceWingbeat.set({ active, processing });
   else if (active) loadVoiceWingbeat().then((glow) => { if (glow) syncVoiceGlow(); });
 }
 
 function prewarmVoiceWingbeat() {
   loadVoiceWingbeat().then((glow) => glow?.prepare?.());
+}
+
+// GPT-Live voice chat: a full-duplex voice that delegates real work to Hermes.
+// The profile opts in with voice.voice_chat_mode: gpt-live and the Hermes host
+// holds the OpenAI key, so the button only shows up for those profiles. The
+// module loads on demand; the panel pays nothing until it is used.
+function loadVoiceLiveModule() {
+  voiceLiveModuleLoading ||= import('./lib/voice-live.mjs').catch((error) => {
+    voiceLiveModuleLoading = null;
+    throw error;
+  });
+  return voiceLiveModuleLoading;
+}
+
+function voiceLiveScopeKey() {
+  return [normalizeGatewayMode(settings.gatewayMode), settings.gatewayUrl || '', safeActiveProfile() || ''].join('|');
+}
+
+// The live session is created by the local Hermes dashboard, like dashboard
+// transcription, so it needs a local connection and WebRTC in this panel.
+function voiceLiveSupported() {
+  return normalizeGatewayMode(settings.gatewayMode) === 'local-api'
+    && typeof globalThis.RTCPeerConnection === 'function'
+    && Boolean(globalThis.navigator?.mediaDevices?.getUserMedia);
+}
+
+function voiceLiveDashboardBaseUrl() {
+  return resolveDashboardTranscriptionBaseUrl({
+    desktopDashboardUrl,
+    gatewayMode: normalizeGatewayMode(settings.gatewayMode),
+    gatewayUrl: settings.gatewayUrl,
+    discover: () => ensureDesktopDashboardUrl({ timeoutMs: 2_500 }),
+  });
+}
+
+function currentVoiceLiveStatus() {
+  return voiceLiveStatus?.scopeKey === voiceLiveScopeKey() ? voiceLiveStatus : null;
+}
+
+function refreshVoiceLiveStatus({ force = false } = {}) {
+  if (!voiceLiveSupported() || !isConnected()) {
+    updateLiveVoiceButtonState();
+    return Promise.resolve(null);
+  }
+  const cached = currentVoiceLiveStatus();
+  if (!force && cached && Date.now() - cached.checkedAt < VOICE_LIVE_STATUS_TTL_MS) return Promise.resolve(cached);
+  voiceLiveStatusLoading ||= (async () => {
+    const scopeKey = voiceLiveScopeKey();
+    let status = null;
+    try {
+      status = await fetchVoiceLiveStatus({ baseUrl: await voiceLiveDashboardBaseUrl(), profile: safeActiveProfile() });
+    } catch {
+      status = null;
+    } finally {
+      voiceLiveStatusLoading = null;
+    }
+    // Remember "not offered" too, so a reconnect burst never turns into polling.
+    voiceLiveStatus = { ...(status || { mode: 'unknown', available: false, reason: '' }), scopeKey, checkedAt: Date.now() };
+    updateLiveVoiceButtonState();
+    return currentVoiceLiveStatus();
+  })();
+  return voiceLiveStatusLoading;
+}
+
+// Capabilities load on connect and reconnect; the probe waits for an idle moment
+// so it never competes with startup work. A pending probe is never pushed back,
+// so frequent connection checks cannot starve it.
+function scheduleVoiceLiveStatusRefresh(delayMs = 1_500) {
+  if (voiceLiveStatusTimer) return;
+  voiceLiveStatusTimer = setTimeout(() => {
+    voiceLiveStatusTimer = null;
+    const run = () => { void refreshVoiceLiveStatus(); };
+    if (typeof globalThis.requestIdleCallback === 'function') globalThis.requestIdleCallback(run, { timeout: 5_000 });
+    else run();
+  }, delayMs);
+}
+
+function updateLiveVoiceButtonState() {
+  if (!els.liveVoiceButton) return;
+  const live = Boolean(liveVoice);
+  const status = currentVoiceLiveStatus();
+  els.liveVoiceButton.hidden = !(live || (status?.mode === 'gpt-live' && isConnected()));
+  els.liveVoiceButton.disabled = !live && (!status?.available || dictating || voiceTransitionInFlight);
+  els.liveVoiceButton.classList.toggle('active', live);
+  els.liveVoiceButton.classList.toggle('live', live);
+  els.liveVoiceButton.setAttribute('aria-pressed', String(live));
+  els.liveVoiceButton.title = live
+    ? 'End live voice chat'
+    : (status?.available
+      ? 'Start live voice chat (GPT-Live)'
+      : `Live voice chat is unavailable: ${status?.reason || 'GPT-Live needs an OpenAI API key on the Hermes host.'}`);
+  els.liveVoiceButton.setAttribute('aria-label', els.liveVoiceButton.title);
+}
+
+function liveVoiceStatusLabel(state = liveVoice) {
+  if (!state) return '';
+  if (state.phase === 'starting') return 'Live voice · Connecting';
+  if (state.speaking) return 'Live voice · Speaking';
+  if (state.delegationId) return 'Live voice · Hermes is working';
+  return 'Live voice · Listening';
+}
+
+function liveVoiceErrorDetail(error) {
+  const name = String(error?.name || '');
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Microphone access is blocked for Hermes. Start voice dictation once to allow the microphone, then try live voice again.';
+  }
+  if (name === 'NotFoundError') return 'No microphone was found.';
+  return String(error?.message || error || 'GPT-Live did not start.');
+}
+
+function liveVoiceSeedHistory(module) {
+  return module.toLiveHistory(messages
+    .filter((message) => message.role === 'user' || message.role === 'assistant')
+    .map((message) => ({ role: message.role, text: typeof message.content === 'string' ? message.content : '' })));
+}
+
+function finishLiveVoiceState(state) {
+  if (!state || liveVoice !== state) return;
+  liveVoice = null;
+  clearInterval(state.tick);
+  clearTimeout(state.utteranceTimer);
+  state.tick = null;
+  state.utteranceTimer = null;
+  updateVoiceButtonState();
+}
+
+function endLiveVoice({ spokenStop = false, quiet = false } = {}) {
+  const state = liveVoice;
+  if (!state) return;
+  finishLiveVoiceState(state);
+  state.session?.close();
+  if (!quiet) setStatus('ok', 'Live voice ended', spokenStop ? 'Ended when you said stop.' : 'The live voice chat is closed.', { translateDetail: false });
+}
+
+async function runLiveVoiceDelegation(state, module, delegationId, prompt, voiceContext) {
+  // Claim the turn first: replies still arriving for an older request are dropped.
+  state.delegationId = delegationId;
+  state.spokenLength = 0;
+  state.lastTool = '';
+  renderVoiceActivity();
+  // A newer request supersedes one still running, so the voice answers what was asked last.
+  if (sending) {
+    await stopCurrentTurn().catch(() => false);
+    for (let waited = 0; sending && waited < 5_000; waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const current = () => liveVoice === state && state.delegationId === delegationId;
+  if (!current()) return;
+  let spoke = false;
+  const speakFrom = (text, settled) => {
+    if (!current()) return;
+    const spoken = module.speakableText(text === '(empty response)' ? '' : text);
+    const { chunk, next } = module.nextSpeakableChunk(spoken, state.spokenLength, { settled });
+    if (!chunk) return;
+    state.session?.speak(delegationId, chunk);
+    state.spokenLength = next;
+    spoke = true;
+  };
+  let sent = false;
+  try {
+    sent = await askHermes(prompt, [], {
+      preserveComposer: true,
+      disableCommandParsing: true,
+      voiceLive: { context: voiceContext, note: module.voiceLiveTurnNote(voiceContext) },
+      onDelta: (text) => speakFrom(text, false),
+      onTool: (activity) => {
+        const label = String(activity?.label || activity?.rawName || '').trim();
+        if (!label || label === state.lastTool || !current()) return;
+        state.lastTool = label;
+        state.session?.think(delegationId, `Hermes is working: ${label}. Not done yet.`);
+      },
+      onComplete: (answer) => speakFrom(answer, true),
+    });
+  } catch {
+    sent = false;
+  }
+  if (!current()) return;
+  if (!sent) state.session?.speak(delegationId, 'Sorry, I could not reach Hermes for that request.');
+  else if (!spoke) state.session?.think(delegationId, 'Hermes finished that request without a spoken result.');
+  state.delegationId = '';
+  renderVoiceActivity();
+}
+
+function liveVoiceHandlers(state, module) {
+  return {
+    // The voice answers a bare "stop" itself and never delegates it, so the
+    // stop phrase is judged on the user's transcript once the utterance settles.
+    onTranscript: (fragment) => {
+      if (liveVoice !== state || fragment.speaker !== 'user') return;
+      state.utterance += fragment.text;
+      clearTimeout(state.utteranceTimer);
+      state.utteranceTimer = setTimeout(() => {
+        state.utteranceTimer = null;
+        const utterance = state.utterance;
+        state.utterance = '';
+        if (liveVoice === state && module.isVoiceStopCommand(utterance)) endLiveVoice({ spokenStop: true });
+      }, 1_500);
+    },
+    onDelegation: (delegationId, context) => {
+      if (liveVoice !== state) return;
+      const { prompt, context: voiceContext } = module.delegationPrompt(context);
+      if (prompt && module.isVoiceStopCommand(prompt)) {
+        endLiveVoice({ spokenStop: true });
+        return;
+      }
+      void runLiveVoiceDelegation(state, module, delegationId, prompt, voiceContext);
+    },
+    onSpeakingChange: (speaking) => {
+      if (liveVoice !== state) return;
+      state.speaking = speaking;
+      renderVoiceActivity();
+    },
+    onError: (message) => {
+      if (liveVoice === state) setStatus('warn', 'Live voice', message, { translateDetail: false });
+    },
+    onClosed: (reason, usageSeconds) => {
+      if (liveVoice !== state) return;
+      finishLiveVoiceState(state);
+      if (reason === 'close_requested') return;
+      const detail = reason === 'connection_lost'
+        ? 'The connection to GPT-Live was lost.'
+        : (reason && reason !== 'closed' ? reason : 'GPT-Live ended the session.');
+      const seconds = Number.isFinite(usageSeconds) ? ` (${Math.round(usageSeconds)}s)` : '';
+      setStatus('warn', 'Live voice ended', `${detail}${seconds}`, { translateDetail: false });
+    },
+  };
+}
+
+async function startLiveVoice() {
+  if (liveVoice || dictating || voiceTransitionInFlight) return;
+  const state = {
+    phase: 'starting',
+    startedAt: Date.now(),
+    speaking: false,
+    delegationId: '',
+    spokenLength: 0,
+    lastTool: '',
+    utterance: '',
+    utteranceTimer: null,
+    tick: null,
+    session: null,
+  };
+  liveVoice = state;
+  state.tick = setInterval(renderVoiceActivity, 250);
+  updateVoiceButtonState();
+  try {
+    if (!isConnected()) throw new Error('Connect to Hermes first.');
+    if (!voiceLiveSupported()) throw new Error('Live voice needs a local Hermes connection and a browser with WebRTC.');
+    const module = await loadVoiceLiveModule();
+    const status = await refreshVoiceLiveStatus({ force: true });
+    if (liveVoice !== state) return;
+    if (status?.mode !== 'gpt-live' || !status.available) {
+      throw new Error(status?.reason || 'Choose GPT-Live as the voice chat mode in Hermes and give the Hermes host an OpenAI API key.');
+    }
+    const baseUrl = await voiceLiveDashboardBaseUrl();
+    const profile = safeActiveProfile();
+    state.session = new module.VoiceLiveSession(liveVoiceHandlers(state, module), {
+      createSession: ({ sdp, history }) => module.requestVoiceLiveSession({ baseUrl, profile, sdp, history }),
+    });
+    await state.session.start(liveVoiceSeedHistory(module));
+    if (liveVoice !== state) {
+      state.session.close();
+      return;
+    }
+    state.phase = 'live';
+    setStatus('ok', 'Live voice on', 'Talk to Hermes. Say "stop", or press the live voice button, to end.', { translateDetail: false });
+  } catch (error) {
+    const wasCurrent = liveVoice === state;
+    finishLiveVoiceState(state);
+    state.session?.close();
+    if (wasCurrent) setStatus('warn', 'Live voice could not start', liveVoiceErrorDetail(error), { translateDetail: false });
+  } finally {
+    if (liveVoice === state) renderVoiceActivity();
+  }
+}
+
+function toggleLiveVoice() {
+  if (liveVoice) {
+    endLiveVoice();
+    return Promise.resolve();
+  }
+  return startLiveVoice();
+}
+
+function prewarmLiveVoice() {
+  loadVoiceLiveModule().catch(() => null);
+  prewarmVoiceWingbeat();
 }
 
 function applyDictationTranscript(transcript = '') {
@@ -19165,6 +19471,14 @@ function currentHermesBrowserSystemPrompt() {
   return `${HERMES_BROWSER_SYSTEM_PROMPT}\n\n${runtimeSelection}`;
 }
 
+// REST turns carry per-turn notes in the system message. A GPT-Live delegation
+// adds the voice note there; the dashboard socket sends surface "voice-live"
+// and the gateway adds the same note itself.
+function turnSystemMessage(voiceLive = null) {
+  const base = currentHermesBrowserSystemPrompt();
+  return voiceLive?.note ? `${base}\n\n${voiceLive.note}` : base;
+}
+
 function currentSelectedModel() {
   const binding = currentEffectiveModelBinding();
   return modelForBinding(binding) || availableModels.find((model) => model.id === settings.model) || null;
@@ -19467,7 +19781,7 @@ async function streamDashboardWsChat(prompt, onDelta, onTool, options = {}) {
   }
 }
 
-async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, { signal, onRun, onSteerQueued, onRuntime, knownAssistantTexts = [], submitPrompt = true, attachments: turnAttachments = [], truncate = null, onSubmitResponse = null } = {}) {
+async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDelta, onTool, { signal, onRun, onSteerQueued, onRuntime, knownAssistantTexts = [], submitPrompt = true, attachments: turnAttachments = [], voiceLive = null, truncate = null, onSubmitResponse = null } = {}) {
   onRun?.(sessionId);
   const { client } = connection;
   const sessionIds = [sessionId, connection.wsSessionId, connection.wsStoredSessionId];
@@ -19595,6 +19909,8 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
       finish(reject, error);
     }));
 
+    // A GPT-Live delegation: the gateway adds the voice turn note itself.
+    const voiceParams = voiceLive ? { surface: 'voice-live', voice_context: String(voiceLive.context || '').slice(0, 6_000) } : {};
     if (submitPrompt) {
       void (async () => {
         try {
@@ -19608,6 +19924,7 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
           text: prompt,
           ...browserTurnDisplayParam(prompt),
           ...truncateSubmitParams({ rowId: truncate?.rowId }),
+          ...voiceParams,
         });
         client.request(WS_METHODS.promptSubmit, submitParams()).catch((error) => {
           if (!isDisplayTextRejection(error) || displayTextUnsupported) throw error;
@@ -19626,7 +19943,7 @@ async function streamDashboardWsChatAttempt(connection, sessionId, prompt, onDel
   });
 }
 
-async function streamSessionChat(prompt, onDelta, onTool, { signal, attachments: turnAttachments = attachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts = [], truncate = null, onSubmitResponse = null } = {}) {
+async function streamSessionChat(prompt, onDelta, onTool, { signal, attachments: turnAttachments = attachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts = [], voiceLive = null, truncate = null, onSubmitResponse = null } = {}) {
   if (usesDashboardWsChatTransport()) return streamDashboardWsChat(prompt, onDelta, onTool, {
     signal,
     attachments: turnAttachments,
@@ -19636,6 +19953,7 @@ async function streamSessionChat(prompt, onDelta, onTool, { signal, attachments:
     knownAssistantTexts,
     truncate,
     onSubmitResponse,
+    voiceLive,
   });
   let hasSessionRoutes = false;
   try {
@@ -19647,14 +19965,14 @@ async function streamSessionChat(prompt, onDelta, onTool, { signal, attachments:
     if (Number(setupError?.httpStatus ?? setupError?.status) === 401 && desktopDashboardUrl && safeActiveProfile()) {
       activeConversationTransport = 'dashboard-ws';
       return streamDashboardWsChat(prompt, onDelta, onTool, {
-        signal, attachments: turnAttachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts,
+        signal, attachments: turnAttachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts, voiceLive,
       });
     }
     throw setupError;
   }
-  if (!hasSessionRoutes) return streamChatCompletions(prompt, onDelta, onTool, { signal, attachments: turnAttachments, onRun, knownAssistantTexts });
+  if (!hasSessionRoutes) return streamChatCompletions(prompt, onDelta, onTool, { signal, attachments: turnAttachments, onRun, knownAssistantTexts, voiceLive });
   try {
-    return await streamSessionChatRest(prompt, onDelta, onTool, { signal, turnAttachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts });
+    return await streamSessionChatRest(prompt, onDelta, onTool, { signal, turnAttachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts, voiceLive });
   } catch (error) {
     // Profile-scoped 401: the gateway multiplexer requires each named
     // profile's own API key. Named-profile sessions still stream over the
@@ -19670,13 +19988,14 @@ async function streamSessionChat(prompt, onDelta, onTool, { signal, attachments:
         onSteerQueued,
         onRuntime,
         knownAssistantTexts,
+        voiceLive,
       });
     }
     throw error;
   }
 }
 
-async function streamSessionChatRest(prompt, onDelta, onTool, { signal, turnAttachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts }) {
+async function streamSessionChatRest(prompt, onDelta, onTool, { signal, turnAttachments, onRun, onSteerQueued, onRuntime, knownAssistantTexts, voiceLive = null }) {
 
   let response;
   try {
@@ -19695,7 +20014,7 @@ async function streamSessionChatRest(prompt, onDelta, onTool, { signal, turnAtta
               gatewayDefault: currentSelectedModel()?.gatewayDefault === true,
             }),
             message: outboundContent(prompt, turnAttachments),
-            system_message: currentHermesBrowserSystemPrompt(),
+            system_message: turnSystemMessage(voiceLive),
           }),
     });
   } catch (error) {
@@ -19721,7 +20040,7 @@ async function streamSessionChatRest(prompt, onDelta, onTool, { signal, turnAtta
   }
 }
 
-async function streamChatCompletions(prompt, onDelta, onTool, { signal, attachments: turnAttachments = attachments, onRun, knownAssistantTexts = [] } = {}) {
+async function streamChatCompletions(prompt, onDelta, onTool, { signal, attachments: turnAttachments = attachments, onRun, knownAssistantTexts = [], voiceLive = null } = {}) {
   let response;
   try {
     response = await apiFetch('/v1/chat/completions', {
@@ -19739,7 +20058,7 @@ async function streamChatCompletions(prompt, onDelta, onTool, { signal, attachme
         model_options: currentModelOptionsPayload(),
         stream: true,
         messages: [
-          { role: 'system', content: currentHermesBrowserSystemPrompt() },
+          { role: 'system', content: turnSystemMessage(voiceLive) },
           { role: 'user', content: outboundContent(prompt, turnAttachments) },
         ],
       }),
@@ -20098,9 +20417,9 @@ async function connectApiWithPairing() {
   }
 }
 
-async function fallbackSessionChat(prompt, turnAttachments = attachments, { onRuntime } = {}) {
+async function fallbackSessionChat(prompt, turnAttachments = attachments, { onRuntime, voiceLive = null } = {}) {
   const hasSessionRoutes = await ensureHermesSession();
-  if (!hasSessionRoutes) return fallbackChatCompletions(prompt, turnAttachments);
+  if (!hasSessionRoutes) return fallbackChatCompletions(prompt, turnAttachments, { voiceLive });
 
   const response = await apiFetch(`/api/sessions/${encodeSessionId(settings.sessionId)}/chat`, {
     method: 'POST',
@@ -20115,7 +20434,7 @@ async function fallbackSessionChat(prompt, turnAttachments = attachments, { onRu
             gatewayDefault: currentSelectedModel()?.gatewayDefault === true,
           }),
           message: outboundContent(prompt, turnAttachments),
-          system_message: currentHermesBrowserSystemPrompt(),
+          system_message: turnSystemMessage(voiceLive),
         }),
   });
   const payload = await readJsonResponse(response);
@@ -20129,7 +20448,7 @@ async function fallbackSessionChat(prompt, turnAttachments = attachments, { onRu
   return extractAssistantText(payload);
 }
 
-async function fallbackChatCompletions(prompt, turnAttachments = attachments) {
+async function fallbackChatCompletions(prompt, turnAttachments = attachments, { voiceLive = null } = {}) {
   const response = await apiFetch('/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -20143,7 +20462,7 @@ async function fallbackChatCompletions(prompt, turnAttachments = attachments) {
       model_options: currentModelOptionsPayload(),
       stream: false,
       messages: [
-        { role: 'system', content: currentHermesBrowserSystemPrompt() },
+        { role: 'system', content: turnSystemMessage(voiceLive) },
         { role: 'user', content: outboundContent(prompt, turnAttachments) },
       ],
     }),
@@ -20429,6 +20748,7 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
           }
           streamPacer.push(liveText.slice(pushedLive));
           pushedLive = liveText.length;
+          turnOptions.onDelta?.(liveText);
         },
         (tool) => {
           if (!runControlGenerationMatches(turnRunControlGeneration, runControlGeneration)) return;
@@ -20437,10 +20757,12 @@ async function askHermes(userText, turnAttachments = [...attachments], turnOptio
           const sources = rawGeneratedImageCandidatesFromResult(activity.result);
           if (sources.length) turnImageSources = [...new Set([...turnImageSources, ...sources])];
           streamView.updateTool(activity);
+          turnOptions.onTool?.(activity);
         },
         {
           signal: activeAbortController.signal,
           attachments: preparedAttachments,
+          voiceLive: turnOptions.voiceLive || null,
           onRun: (runId) => {
             if (!runControlGenerationMatches(turnRunControlGeneration, runControlGeneration)) return;
             // Dashboard prompt streams report the live session id here, not a
@@ -20489,6 +20811,7 @@ ${streamError.message}`);
         } else if (fallbackSafe || recoveryAction === 'fallback') {
           streamView.update(`Streaming failed, retrying non-streaming...\n${streamError.message}`);
           answer = await fallbackSessionChat(prompt, preparedAttachments, {
+            voiceLive: turnOptions.voiceLive || null,
             onRuntime: (payload) => {
               if (!runControlGenerationMatches(turnRunControlGeneration, runControlGeneration)) return;
               applyTurnRuntimePayload(payload);
@@ -21999,6 +22322,7 @@ function bindEvents() {
   });
   window.addEventListener('pagehide', () => {
     persistCurrentComposerDraft({ immediate: true });
+    endLiveVoice({ quiet: true });
     const tab = currentContext?.activeTab || annotationTargetTab();
     if (tab?.id) {
       browserApi.tabs.sendMessage(tab.id, { type: PAGE_ANNOTATION_MESSAGES.ABORT }).catch(() => {});
@@ -22098,6 +22422,11 @@ function bindEvents() {
   // Warm the glow while the pointer (or keyboard focus) is on its way to the mic.
   els.voiceButton?.addEventListener('pointerenter', prewarmVoiceWingbeat, { once: true, passive: true });
   els.voiceButton?.addEventListener('focus', prewarmVoiceWingbeat, { once: true });
+  els.liveVoiceButton?.addEventListener('pointerenter', prewarmLiveVoice, { once: true, passive: true });
+  els.liveVoiceButton?.addEventListener('focus', prewarmLiveVoice, { once: true });
+  els.liveVoiceButton?.addEventListener('click', () => {
+    void toggleLiveVoice();
+  });
   els.voiceButton?.addEventListener('click', () => {
     toggleVoiceDictation().catch((error) => {
       voiceTransitionInFlight = false;

@@ -37,6 +37,7 @@ const requiredFiles = [
   'voice-dictation.js',
   'lib/voice-wingbeat.mjs',
   'lib/voice-wingbeat.css',
+  'lib/voice-live.mjs',
   'lib/browser-context-protocol.mjs',
   'lib/runtime-events.mjs',
   'lib/support-diagnostics.mjs',
