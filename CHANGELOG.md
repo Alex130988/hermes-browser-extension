@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- New tabs keep the model you picked in the side panel, including Gateway default, instead of switching to the first model in the list, which could be a provider with no credits left. A saved model the list does not show yet stays selected with its provider, and on dashboard and remote connections Gateway default starts chats on your profile's own default model. Thanks to @Prediction6767 for the report and root cause (#119).
 - The message box grows as you type, and once it is as tall as it can get your latest text stays in view above the commands button instead of sliding under it. The same happens after voice dictation.
 - Scrolling back up through a long draft shows the lines passing under the composer controls through a tinted glass band instead of a hard cutoff. The band only appears while text sits below the visible area, the controls stay solid, and the message box can still be dragged taller.
 - Open on computer now reveals the original file in its folder on a local connection instead of downloading a second copy, and refuses on remote connections. Save remains a separate download.

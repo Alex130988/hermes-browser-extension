@@ -1166,7 +1166,7 @@ test('model runtime ack helper distinguishes pending confirmed and mismatch stat
 
 test('custom model source rows are discovery-only until Hermes exposes them through the runtime', () => {
   const source = readFileSync(new URL('../extension/sidepanel.js', import.meta.url), 'utf8');
-  assert.match(source, /selectedModel\?\.source === 'external'/);
+  assert.match(source, /listed\?\.source === 'external'/);
   assert.match(source, /button\.disabled = true/);
   assert.match(source, /Custom model source is discovery-only/);
   assert.match(source, /normalizeExternalModelSourceList\(settings\.customModelSources/);

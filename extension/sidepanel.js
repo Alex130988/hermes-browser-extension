@@ -91,6 +91,8 @@ import {
   resolveBrowserEffectiveModel,
   resolveBrowserEffectiveModelOptions,
   resolveCatalogModelIdForBinding,
+  resolveStoredModelSelection,
+  dashboardSessionModelParams,
   skillSuggestionsForInput,
   restSkillsFallbackAllowed,
   shouldRecoverSkillsFromDashboard,
@@ -7712,6 +7714,38 @@ async function reconcileInlineAssistModelBinding(models = availableModels) {
   return true;
 }
 
+// Display row for a stored choice the current catalog does not list (yet). The
+// startup cache never stores gateway alias rows, so the saved Gateway default
+// shows as itself instead of as whichever row happens to come first.
+function unlistedModelSelectionRow(binding = null, modelId = settings.model) {
+  const pinned = binding && (binding.modelId === modelId || binding.rawModelId === modelId) ? binding : null;
+  if (modelId === DEFAULT_SETTINGS.model || pinned?.gatewayDefault === true) {
+    return {
+      id: modelId,
+      rawModelId: pinned?.rawModelId || modelId,
+      label: translateUiText('Gateway default'),
+      provider: '',
+      providerLabel: 'Hermes gateway',
+      contextTokens: pinned?.contextTokens || 0,
+      gatewayAlias: true,
+      gatewayDefault: true,
+      source: 'gateway',
+      runtimeSelectable: true,
+    };
+  }
+  return {
+    id: modelId,
+    rawModelId: pinned?.rawModelId || modelId,
+    label: pinned?.rawModelId || modelId,
+    provider: pinned?.provider || '',
+    providerLabel: pinned?.provider || '',
+    contextTokens: pinned?.contextTokens || 0,
+    ...(pinned?.gatewayAlias ? { gatewayAlias: true } : {}),
+    source: 'selected',
+    runtimeSelectable: true,
+  };
+}
+
 function renderModelOptions(models = availableModels) {
   const effectiveBinding = currentEffectiveModelBinding();
   const effectiveModelId = resolveCatalogModelIdForBinding({ binding: effectiveBinding, models });
@@ -7724,18 +7758,9 @@ function renderModelOptions(models = availableModels) {
   }
   const normalized = models.length ? models : normalizeHermesModels([], settings.model);
   availableModels = normalized;
-  const selectedIsDefaultFallback =
-    settings.model === DEFAULT_SETTINGS.model &&
-    normalized.length > 1 &&
-    normalized[0]?.id !== settings.model;
-  const selectedModel = normalized.find((model) => model.id === settings.model);
-  if (selectedModel?.source === 'external') {
-    const runtimeModel = normalized.find((model) => isModelRuntimeSelectable(model));
-    settings.model = runtimeModel?.id || DEFAULT_SETTINGS.model;
-  } else if (selectedIsDefaultFallback || !selectedModel) {
-    settings.model = normalized[0]?.id || DEFAULT_SETTINGS.model;
-  }
-  const selected = normalized.find((model) => model.id === settings.model) || normalized[0];
+  settings.model = resolveStoredModelSelection({ selectedId: settings.model, binding: effectiveBinding, models: normalized }).modelId;
+  const listed = normalized.find((model) => model.id === settings.model);
+  const selected = listed && listed.source !== 'selected' ? listed : unlistedModelSelectionRow(effectiveBinding, settings.model);
   if (selected) {
     settings.modelContextTokens = selected.contextTokens || 0;
     const providerLabel = modelProviderLabel(selected);
@@ -8398,23 +8423,30 @@ function applySelectedModel(selectedId, { persist = true, keepOpen = false } = {
   const previousId = settings.model;
   const previousBinding = currentEffectiveModelBinding();
   const nextId = selectedId || DEFAULT_SETTINGS.model;
-  const selected = availableModels.find((model) => model.id === nextId);
-  if (selected?.source === 'external') {
-    selectedModelProvider = modelProviderLabel(selected);
+  const listed = availableModels.find((model) => model.id === nextId);
+  if (listed?.source === 'external') {
+    selectedModelProvider = modelProviderLabel(listed);
     renderModelMenu();
     setStatus('warn', 'Custom model source is discovery-only', 'This model was discovered from a custom endpoint, but Hermes must expose it through the connected runtime before Browser can route requests to it.');
     return;
   }
+  // A 'selected' placeholder only stands in for a choice the catalog does not
+  // list. Its owner is not a provider, so the saved binding is kept as is.
+  const selected = listed?.source === 'selected' ? null : listed;
+  const keptBinding = !selected && previousBinding
+    && (previousBinding.modelId === nextId || previousBinding.rawModelId === nextId)
+    ? previousBinding
+    : null;
   if (selected) selectedModelProvider = modelProviderLabel(selected);
   const scope = updateBrowserModelScope({
-    selectedModel: selected ? modelBindingFromModel(selected) : { modelId: nextId, rawModelId: nextId, contextTokens: 0 },
+    selectedModel: selected ? modelBindingFromModel(selected) : (keptBinding || { modelId: nextId, rawModelId: nextId, contextTokens: 0 }),
     sessionId: settings.sessionId,
     sessionModelBindings: settings.sessionModelBindings || {},
   });
   settings = {
     ...settings,
     model: nextId,
-    modelContextTokens: selected?.contextTokens || 0,
+    modelContextTokens: selected?.contextTokens || keptBinding?.contextTokens || 0,
     extensionPreferredModel: scope.extensionPreferredModel,
     sessionModelBindings: scope.sessionModelBindings,
     modelScopeVersion: DEFAULT_SETTINGS.modelScopeVersion,
@@ -15403,8 +15435,11 @@ async function createHermesBrowserSession({ title = makeBrowserSessionTitle(), f
           hidden,
           ...(source === 'hermes_bot_mode' ? { follow_profile_config: true } : {}),
           source: source || settings.sessionSource || DEFAULT_SETTINGS.sessionSource,
-          model: requestModel,
-          provider: requestProvider || undefined,
+          ...dashboardSessionModelParams({
+            model: requestModel,
+            provider: requestProvider,
+            gatewayDefault: preferredModel?.gatewayDefault === true || preferredBinding?.gatewayDefault === true,
+          }),
           reasoning_effort: preferredOptions.thinkingEnabled ? preferredOptions.reasoningEffort : 'none',
           fast: preferredOptions.fastMode,
           profile: safeActiveProfile(),
@@ -19147,6 +19182,17 @@ function currentModelProviderSlug() {
   return selected?.provider || binding?.provider || '';
 }
 
+// The dashboard socket's session.create takes a literal model; the Gateway
+// default alias goes out as "no override" so the profile's own default runs.
+function currentDashboardModelParams() {
+  const binding = currentEffectiveModelBinding();
+  return dashboardSessionModelParams({
+    model: currentModelRequestId(),
+    provider: currentModelProviderSlug(),
+    gatewayDefault: currentSelectedModel()?.gatewayDefault === true || binding?.gatewayDefault === true,
+  });
+}
+
 function applyPendingModelRuntimeAck(runtime = {}) {
   if (!pendingModelRuntimeAck || !runtime || typeof runtime !== 'object') return;
   const ack = modelRuntimeAckState({
@@ -19299,8 +19345,7 @@ async function ensureRemoteWsSession(connection) {
     storedSessionId,
     createParams: {
       title: settings.sessionTitle,
-      model: currentModelRequestId(),
-      provider: currentModelProviderSlug() || binding?.provider || undefined,
+      ...currentDashboardModelParams(),
       reasoning_effort: normalizeReasoningEffort(settings.reasoningEffort),
       fast: normalizeFastMode(settings.fastMode),
       profile: safeActiveProfile(),
@@ -19330,15 +19375,22 @@ async function ensureRemoteWsSession(connection) {
       },
       modelScopeVersion: DEFAULT_SETTINGS.modelScopeVersion,
     };
-    try {
-      const request = buildSessionModelSwitchRequest({
-        sessionId: liveId,
-        model: binding.rawModelId || binding.modelId,
-        provider: binding.provider,
-      });
-      await connection.client.request(request.method, request.params);
-    } catch (error) {
-      console.warn('[Hermes] Cloud model selection was not applied:', error?.message || error);
+    const switchTo = dashboardSessionModelParams({
+      model: binding.rawModelId || binding.modelId,
+      provider: binding.provider,
+      gatewayDefault: binding.gatewayDefault === true,
+    });
+    if (switchTo.model) {
+      try {
+        const request = buildSessionModelSwitchRequest({
+          sessionId: liveId,
+          model: switchTo.model,
+          provider: switchTo.provider,
+        });
+        await connection.client.request(request.method, request.params);
+      } catch (error) {
+        console.warn('[Hermes] Cloud model selection was not applied:', error?.message || error);
+      }
     }
   }
   try {
@@ -20719,8 +20771,7 @@ async function createInlineBackgroundSession(request) {
       client: connection.client,
       createParams: {
         title,
-        model: currentModelRequestId(),
-        provider: currentModelProviderSlug() || undefined,
+        ...currentDashboardModelParams(),
         reasoning_effort: normalizeReasoningEffort(settings.reasoningEffort),
         fast: normalizeFastMode(settings.fastMode),
       },

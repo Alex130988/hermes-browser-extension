@@ -1487,6 +1487,49 @@ export function resolveCatalogModelIdForBinding({ binding = null, models = [] } 
   return String(match?.id || normalized.modelId || normalized.rawModelId || '').trim();
 }
 
+// The catalog row a stored model choice resolves to after a catalog render.
+// Catalog order is presentation, not preference (#119): an explicit choice is
+// kept even when this catalog does not list it, because the startup cache
+// never stores gateway alias rows and one profile's catalog can omit a model
+// another verified. Only an empty choice, or a discovery-only row Hermes
+// cannot route, falls back: to the gateway's own default row, else the first
+// routable row.
+export function resolveStoredModelSelection({ selectedId = '', binding = null, models = [] } = {}) {
+  const catalog = Array.isArray(models) ? models.filter((model) => model && typeof model === 'object') : [];
+  const id = String(selectedId || '').trim();
+  const pinned = normalizeBrowserModelBinding(binding);
+  const gatewayDefault = catalog.find((model) => model.gatewayDefault === true && isModelRuntimeSelectable(model));
+  const fallback = () => {
+    const row = gatewayDefault || catalog.find((model) => isModelRuntimeSelectable(model));
+    return { modelId: String(row?.id || DEFAULT_SETTINGS.model), listed: Boolean(row), fallback: true };
+  };
+  if (!id) return fallback();
+  const row = catalog.find((model) => model.id === id);
+  if (row && row.source !== 'selected' && isModelRuntimeSelectable(row)) return { modelId: id, listed: true, fallback: false };
+  const rawMatch = catalog.find((model) => model.rawModelId === id
+    && isModelRuntimeSelectable(model)
+    && (!pinned?.provider || model.provider === pinned.provider || model.owner === pinned.provider));
+  if (rawMatch) return { modelId: String(rawMatch.id), listed: true, fallback: false };
+  if (id === DEFAULT_SETTINGS.model || (pinned?.gatewayDefault === true && pinned.modelId === id)) {
+    // The gateway resolves its default alias itself; a named profile advertises it under its own id.
+    return gatewayDefault
+      ? { modelId: String(gatewayDefault.id), listed: true, fallback: false }
+      : { modelId: id, listed: false, fallback: false };
+  }
+  if (row?.source === 'external') return fallback();
+  return { modelId: id, listed: Boolean(row && row.source !== 'selected'), fallback: false };
+}
+
+// session.create and config.set on the dashboard socket take a literal model.
+// The gateway default alias is not one: leaving the model out is what runs the
+// profile's own default there.
+export function dashboardSessionModelParams({ model = '', provider = '', gatewayDefault = false } = {}) {
+  const modelId = String(model || '').trim();
+  if (!modelId || gatewayDefault === true || modelId === DEFAULT_SETTINGS.model) return {};
+  const providerId = String(provider || '').trim();
+  return providerId ? { model: modelId, provider: providerId } : { model: modelId };
+}
+
 export function updateBrowserModelScope({ selectedModel = null, sessionId = '', sessionModelBindings = {} } = {}) {
   const binding = normalizeBrowserModelBinding(selectedModel);
   const nextBindings = { ...(sessionModelBindings && typeof sessionModelBindings === 'object' ? sessionModelBindings : {}) };
